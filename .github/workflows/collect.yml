@@ -19,7 +19,7 @@ jobs:
     steps:
       # Sparse checkout: only pull the collector and mayor log, not the
       # thousands of old snapshot files, so runs stay fast as data piles up.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: |
             collector
