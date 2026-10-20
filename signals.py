@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from features import add_features, load_mayor, load_snapshots, to_grid
+from skyblock_calendar import summary
 
 
 def main():
@@ -27,15 +28,18 @@ def main():
     meta = json.loads((model_dir / "meta.json").read_text())
     booster = lgb.Booster(model_file=str(model_dir / "model.txt"))
 
-    raw = load_snapshots(args.data, days=3)  # enough history for the 24h features
+    raw = load_snapshots(args.data)  # full history: seasonal_lift learns from every past SkyBlock year
     df = add_features(to_grid(raw, meta["freq"]), load_mayor(args.data),
                       meta["freq"], meta["horizon"], meta["tax"])
     latest = df[df["time"] == df["time"].max()]
     latest = latest[latest["log_coin_vol"] >= np.log1p(meta["min_coin_vol"])].copy()
 
     age = pd.Timestamp.now(tz="UTC") - pd.to_datetime(raw["ts"].max(), unit="ms", utc=True)
+    mayor = load_mayor(args.data)
+    perks = mayor["perks"].iloc[-1] if mayor is not None else ""
     print(f"Latest snapshot is {age.total_seconds() / 60:.0f} min old. "
-          f"Predicting the next {meta['horizon']:g}h.\n")
+          f"Predicting the next {meta['horizon']:g}h.")
+    print(summary(int(raw["ts"].max()), perks) + "\n")
 
     latest["pred_move"] = np.expm1(booster.predict(latest[meta["features"]]))
     latest["edge"] = latest["pred_move"] - latest["spread_pct"] - meta["tax"]

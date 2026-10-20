@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from skyblock_calendar import CALENDAR_FEATURES, YEAR_DAYS, day_of_year, event_features
+
 TAX = 0.0125  # Bazaar sell tax. 1.125% / 1% if you have the Bazaar Flipper upgrades.
 
 
@@ -24,9 +26,43 @@ def load_mayor(data_dir="data"):
     path = Path(data_dir) / "mayor.csv"
     if not path.exists():
         return None
-    m = pd.read_csv(path)
+    m = pd.read_csv(path, keep_default_na=False)
     m["time"] = pd.to_datetime(m["ts"], unit="ms", utc=True)
+    if "perks" not in m.columns:
+        m["perks"] = ""
     return m
+
+
+def _to_ms(times):
+    return np.asarray((times - pd.Timestamp(0, tz="UTC")) // pd.Timedelta("1ms"), dtype=np.int64)
+
+
+def seasonal_lift(g, bph, hold_hours=3, bucket_days=6, prior=50):
+    """How this item has usually moved over the next `hold_hours` at this point
+    of the SkyBlock year, learned only from data before each moment (no look-ahead).
+
+    Every calendar event sits at a fixed point of the SkyBlock year, which
+    repeats every 5d 4h real time, so this picks up item-specific event effects
+    (candy around Spooky Festival, gifts around Jerry, ...) without hard-coding
+    which items each event moves. `prior` shrinks thin estimates toward zero.
+    """
+    lm = g.pivot(index="time", columns="item", values="log_mid")
+    h = int(hold_hours * bph)
+    fwd = (lm.shift(-h) - lm).to_numpy()  # the move starting at row s is known at row s + h
+    buckets = (day_of_year(_to_ms(lm.index)) // bucket_days).astype(int)
+    n_buckets = int(np.ceil(YEAR_DAYS / bucket_days))
+    sums = np.zeros((n_buckets, lm.shape[1]))
+    counts = np.zeros((n_buckets, lm.shape[1]))
+    out = np.zeros(lm.shape)
+    for t in range(len(lm)):
+        s = t - h
+        if s >= 0:
+            ok = np.isfinite(fwd[s])
+            sums[buckets[s], ok] += fwd[s, ok]
+            counts[buckets[s], ok] += 1
+        out[t] = sums[buckets[t]] / (counts[buckets[t]] + prior)
+    return (pd.DataFrame(out, index=lm.index, columns=lm.columns).reset_index()
+            .melt(id_vars="time", var_name="item", value_name="seasonal_lift"))
 
 
 def to_grid(df, freq="10min", max_gap=3):
@@ -102,11 +138,20 @@ def add_features(grid, mayor=None, freq="10min", horizon_hours=1.0, tax=TAX):
     g["y"] = by_item("log_mid").shift(-horizon) - g["log_mid"]
     g["trade_ret"] = by_item("bid").shift(-horizon) * (1 - tax) / g["ask"] - 1
 
+    # Item-specific seasonality (event effects), learned causally
+    g = g.merge(seasonal_lift(g, bph), on=["time", "item"], how="left")
+
+    # Mayor + SkyBlock calendar events, computed once per time step
+    tf = pd.DataFrame({"time": pd.Series(g["time"].unique()).sort_values(ignore_index=True)})
     if mayor is not None and len(mayor):
-        g = pd.merge_asof(g.sort_values("time"), mayor[["time", "mayor"]].sort_values("time"),
-                          on="time", direction="backward")
-        g = g.sort_values(["item", "time"]).reset_index(drop=True)
-        g["mayor"] = g["mayor"].astype("category")
+        tf = pd.merge_asof(tf, mayor[["time", "mayor", "minister", "perks"]].sort_values("time"),
+                           on="time", direction="backward")
+    perks = tf["perks"].to_numpy() if "perks" in tf.columns else None
+    tf = pd.concat([tf, pd.DataFrame(event_features(_to_ms(tf["time"]), perks))], axis=1)
+    g = g.merge(tf.drop(columns="perks", errors="ignore"), on="time", how="left")
+    for col in ("mayor", "minister"):
+        if col in g.columns:
+            g[col] = g[col].astype("category")
 
     return g.replace([np.inf, -np.inf], np.nan)
 
@@ -116,8 +161,9 @@ FEATURES = [
     "flow_imbalance", "log_coin_vol", "ask_thinness", "bid_thinness",
     "ret_1h", "ret_3h", "ret_6h", "ret_24h", "vol_6h", "vol_24h", "z_24h",
     "spread_rel_24h", "coin_vol_chg_6h", "book_imb_chg_1h", "hour", "dow",
-]
+    "seasonal_lift",
+] + CALENDAR_FEATURES
 
 
 def feature_columns(df):
-    return FEATURES + (["mayor"] if "mayor" in df.columns else [])
+    return FEATURES + [c for c in ("mayor", "minister") if c in df.columns]

@@ -98,23 +98,32 @@ def save_snapshot(ts, rows):
 
 
 def save_mayor(ts):
-    """Append the current mayor/minister to data/mayor.csv, only when it changes."""
+    """Append mayor, minister and active perks to data/mayor.csv, only when they change.
+
+    Perks decide events like Fishing Festival (Marina) and Mining Fiesta (Cole),
+    and Mayor Jerry swaps perks mid-term, so perks are tracked, not just names.
+    """
     try:
         mayor = fetch(ELECTION_URL, tries=2).get("mayor") or {}
     except Exception as e:
         print(f"election fetch failed, skipping mayor: {e}", file=sys.stderr)
         return
-    current = [mayor.get("name", ""), (mayor.get("minister") or {}).get("name", "")]
+    minister = mayor.get("minister") or {}
+    perks = [p.get("name", "") for p in mayor.get("perks") or []]
+    if (minister.get("perk") or {}).get("name"):
+        perks.append(minister["perk"]["name"])
+    current = [mayor.get("name", ""), minister.get("name", ""), "|".join(perks)]
     path = DATA / "mayor.csv"
     if path.exists():
-        lines = path.read_text().strip().splitlines()
-        if len(lines) > 1 and lines[-1].split(",")[1:] == current:
+        with open(path, newline="") as f:
+            rows = list(csv.reader(f))
+        if len(rows) > 1 and rows[-1][1:] == current:
             return
     is_new = not path.exists()
     with open(path, "a", newline="") as f:
         writer = csv.writer(f, lineterminator="\n")
         if is_new:
-            writer.writerow(["ts", "mayor", "minister"])
+            writer.writerow(["ts", "mayor", "minister", "perks"])
         writer.writerow([ts, *current])
     print(f"mayor changed: {current}")
 

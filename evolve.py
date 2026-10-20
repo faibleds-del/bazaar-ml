@@ -19,8 +19,8 @@ only for the final score.
 Simulation model (deliberately simple; see README for its limits):
   - buy order placed at best bid + 0.1, sell offer at best ask - 0.1
   - while our order is the best price, it fills from the instant-sell (or
-    instant-buy) flow implied by weekly volume, times --fill-share to account
-    for competing flippers
+    instant-buy) flow implied by weekly volume, times --fill-share (default 5%)
+    to account for all the other flippers competing for the same flow
   - if the market moves through our price, the order fills completely
   - 1.25% tax on every sale, 14 open orders max, 71,680 units max per order
 """
@@ -36,7 +36,8 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from features import TAX, add_features, load_snapshots, to_grid
+from features import TAX, add_features, load_mayor, load_snapshots, to_grid
+from skyblock_calendar import summary
 
 TICK = 0.1
 ORDER_SLOTS = 14
@@ -50,12 +51,15 @@ GENES = [
     ("max_z", -3.0, 3.0, "lin"),            # only buy when price is below its 24h mean by this many sd
     ("min_momentum", -0.2, 0.2, "lin"),     # only buy when 6h price change is above this
     ("min_book_imb", -1.0, 1.0, "lin"),     # only buy when (buy orders - sell offers) imbalance is above this
+    ("min_season", -0.05, 0.05, "lin"),     # only buy when the item usually rises at this point of the
+                                            # SkyBlock year (events), by at least this much
     ("w_spread", -1.0, 1.0, "lin"),         # ranking weights for choosing among candidates
     ("w_momentum", -1.0, 1.0, "lin"),
     ("w_dip", -1.0, 1.0, "lin"),
     ("w_book", -1.0, 1.0, "lin"),
     ("w_volume", -1.0, 1.0, "lin"),
     ("w_flow", -1.0, 1.0, "lin"),
+    ("w_season", -1.0, 1.0, "lin"),
     ("alloc", 0.02, 0.5, "log"),            # fraction of total coins per order
     ("max_positions", 1, ORDER_SLOTS, "int"),
     ("buy_ttl_h", 0.2, 6.0, "log"),         # cancel unfilled buy orders after this many hours
@@ -64,14 +68,14 @@ GENES = [
     ("min_margin", 0.0, 0.1, "lin"),        # never list a sell offer below cost + this, after tax
     ("stop_loss", 0.02, 0.5, "log"),        # instant-sell if bid drops this far below cost
 ]
-WEIGHTS = ["w_spread", "w_momentum", "w_dip", "w_book", "w_volume", "w_flow"]
+WEIGHTS = ["w_spread", "w_momentum", "w_dip", "w_book", "w_volume", "w_flow", "w_season"]
 N_GENES = len(GENES)
 
 # A hand-written "normal flipper" to compare the evolved bots against
 CLASSIC_FLIPPER = dict(
     min_spread=0.03, max_spread=0.3, min_coin_vol=1e9, max_z=3.0, min_momentum=-0.2,
-    min_book_imb=-1.0, w_spread=1.0, w_momentum=0.0, w_dip=0.0, w_book=0.0, w_volume=0.0,
-    w_flow=0.0, alloc=0.1, max_positions=10, buy_ttl_h=2.0, sell_ttl_h=12.0, chase=1.0,
+    min_book_imb=-1.0, min_season=-0.05, w_spread=1.0, w_momentum=0.0, w_dip=0.0, w_book=0.0,
+    w_volume=0.0, w_flow=0.0, w_season=0.0, alloc=0.1, max_positions=10, buy_ttl_h=2.0, sell_ttl_h=12.0, chase=1.0,
     min_margin=0.01, stop_loss=0.15,
 )
 
@@ -107,7 +111,8 @@ def describe(g):
     return (
         f"Buys items with spread {g['min_spread']:.1%}-{g['max_spread']:.1%}, weekly volume >= "
         f"{g['min_coin_vol'] / 1e6:,.0f}M coins, 24h z-score < {g['max_z']:+.1f}, 6h move > "
-        f"{g['min_momentum']:+.1%}, book imbalance > {g['min_book_imb']:+.2f}. Prefers {prefs}.\n"
+        f"{g['min_momentum']:+.1%}, book imbalance > {g['min_book_imb']:+.2f}, seasonal lift > "
+        f"{g['min_season']:+.1%}. Prefers {prefs}.\n"
         f"  Up to {g['max_positions']} orders at {g['alloc']:.0%} of coins each. Cancels buys after "
         f"{g['buy_ttl_h']:.1f}h, sells at >= {g['min_margin']:.1%} profit, dumps after "
         f"{g['sell_ttl_h']:.1f}h or a {g['stop_loss']:.0%} drop. "
@@ -143,7 +148,7 @@ def build_market(data_dir, freq, days=None, min_presence=0.5):
     m = SimpleNamespace(
         times=ask.index, items=list(items), bph=bph,
         ask=arr("ask"), bid=arr("bid"), spread=arr("spread_pct"),
-        z=arr("z_24h"), mom=arr("ret_6h"), imb=arr("book_imbalance"),
+        z=arr("z_24h"), mom=arr("ret_6h"), imb=arr("book_imbalance"), season=arr("seasonal_lift"),
         buy_flow=arr("buy_week") / per_bin,    # instant-buys per bin -> fills our sell offers
         sell_flow=arr("sell_week") / per_bin,  # instant-sells per bin -> fills our buy orders
     )
@@ -151,7 +156,7 @@ def build_market(data_dir, freq, days=None, min_presence=0.5):
     m.valid = np.isfinite(m.ask) & np.isfinite(m.bid) & (m.ask > m.bid)
     m.rank_feats = np.stack([
         _xs_zscore(m.spread), _xs_zscore(m.mom), _xs_zscore(-m.z), _xs_zscore(m.imb),
-        _xs_zscore(np.log1p(m.coin_vol)), _xs_zscore(arr("flow_imbalance")),
+        _xs_zscore(np.log1p(m.coin_vol)), _xs_zscore(arr("flow_imbalance")), _xs_zscore(m.season),
     ], axis=-1).astype(np.float32)
     m.n_times, m.n_items = m.ask.shape
     return m
@@ -258,7 +263,8 @@ def simulate(g, t0, t1, m):
         ok = (valid & ~held
               & (spread >= g["min_spread"]) & (spread <= g["max_spread"])
               & (m.coin_vol[t] >= g["min_coin_vol"]) & (m.z[t] < g["max_z"])
-              & (m.mom[t] > g["min_momentum"]) & (m.imb[t] > g["min_book_imb"]))
+              & (m.mom[t] > g["min_momentum"]) & (m.imb[t] > g["min_book_imb"])
+              & (m.season[t] >= g["min_season"]))
         idx = np.flatnonzero(ok)
         if idx.size == 0:
             continue
@@ -346,11 +352,15 @@ def live(args, m):
     bot = json.loads(Path(args.live).read_text())
     g = decode(encode(bot["genes"]))
     t = m.n_times - 1
-    print(f"Bot: {describe(g)}\nData as of {m.times[t]:%Y-%m-%d %H:%M} UTC\n")
+    mayor = load_mayor(args.data)
+    perks = mayor["perks"].iloc[-1] if mayor is not None else ""
+    print(f"Bot: {describe(g)}\nData as of {m.times[t]:%Y-%m-%d %H:%M} UTC")
+    print(summary(int(m.times[t].timestamp() * 1000), perks) + "\n")
     spread = m.spread[t]
     ok = (m.valid[t] & (spread >= g["min_spread"]) & (spread <= g["max_spread"])
           & (m.coin_vol[t] >= g["min_coin_vol"]) & (m.z[t] < g["max_z"])
-          & (m.mom[t] > g["min_momentum"]) & (m.imb[t] > g["min_book_imb"]))
+          & (m.mom[t] > g["min_momentum"]) & (m.imb[t] > g["min_book_imb"])
+          & (m.season[t] >= g["min_season"]))
     idx = np.flatnonzero(ok)
     if idx.size == 0:
         print("Nothing passes this bot's filters right now. It would sit on its coins.")
@@ -383,8 +393,8 @@ def main():
     ap.add_argument("--rotate-every", type=int, default=5, help="new trial windows every N generations")
     ap.add_argument("--test-frac", type=float, default=0.25, help="newest data held out for the final test")
     ap.add_argument("--coins", type=float, default=10e6)
-    ap.add_argument("--fill-share", type=float, default=0.5,
-                    help="share of instant-buy/sell flow our top-of-book order gets")
+    ap.add_argument("--fill-share", type=float, default=0.05,
+                    help="share of instant-buy/sell flow our top-of-book order gets (lots of competing flippers)")
     ap.add_argument("--tax", type=float, default=TAX)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=os.cpu_count())
@@ -393,7 +403,7 @@ def main():
     ap.add_argument("--live", metavar="BOT_JSON", help="show what a saved bot would do right now")
     args = ap.parse_args()
 
-    m = build_market(args.data, args.freq, days=3 if args.live else None)
+    m = build_market(args.data, args.freq)  # full history, also in --live: seasonal_lift needs past years
     m.coins, m.fill_share, m.tax = args.coins, args.fill_share, args.tax
     MARKET = m
     if args.live:
