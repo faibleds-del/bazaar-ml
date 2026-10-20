@@ -11,7 +11,26 @@ Predicts short-term Hypixel SkyBlock Bazaar price moves. Costs $0 to run:
 1. Create a **public** repo on GitHub (e.g. `bazaar-ml`). Public repos get unlimited Actions minutes; private ones burn through the free quota fast.
 2. Push this folder to it (or drag the files into the GitHub web uploader, keeping the `.github/workflows/` folder).
 3. On GitHub, open **Actions**, select **collect**, and click **Run workflow** once. After about 30 seconds a `snapshot ...` commit should show up with a file under `data/snapshots/`.
-4. Leave it running. The cron then fires on its own.
+4. Set up the external trigger below. GitHub's own `*/5` cron is best-effort: on a new, quiet repo it can run as rarely as once every few hours.
+
+### Reliable 5-minute trigger (cron-job.org, free)
+
+1. On GitHub, go to **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
+   - Repository access: **Only select repositories → bazaar-ml**.
+   - Permissions: **Actions → Read and write**. Nothing else.
+   - Expiration: up to 1 year. Set a reminder to renew it.
+2. Make a free account at cron-job.org and create a cronjob:
+   - URL: `https://api.github.com/repos/faibleds-del/bazaar-ml/actions/workflows/collect.yml/dispatches`
+   - Schedule: every 5 minutes.
+   - Advanced → Request method: **POST**.
+   - Advanced → Headers:
+     - `Authorization: Bearer <your token>`
+     - `Accept: application/vnd.github+json`
+     - `X-GitHub-Api-Version: 2022-11-28`
+   - Advanced → Request body: `{"ref":"main"}`
+3. Use **Test run**. A `204 No Content` response means it worked, and a new run appears under Actions within seconds.
+
+The GitHub cron stays in place as a backup. Duplicate runs are harmless, because a snapshot that's already saved produces no commit.
 
 ## Training
 
